@@ -21,7 +21,7 @@ REQUEST_DELAY_SECONDS = 0.20
 MAX_API_RETRIES = 3
 TIMEOUT_SECS = 20
 BAN_SLEEP_FALLBACK = 65     # if Retry-After header absent
-DEFAULT_LOOKBACK_DAYS = 365
+DEFAULT_LOOKBACK_DAYS = 30
 SLEEP_BETWEEN_FULL_PASSES = 300
 
 # MySQL connection (TCP/IP) - Load from environment variables
@@ -123,6 +123,33 @@ def get_latest_ts_per_market(conn) -> Dict[str, int]:
                 out[row["market"]] = int(row["latest_ts"])
     return out
 
+def is_day_complete(conn, market: str, date_str: str) -> bool:
+    """Check if a specific day has sufficient data (at least 20 hours worth)"""
+    try:
+        date_obj = datetime.strptime(date_str, '%Y-%m-%d')
+        start_ts = date_obj.replace(tzinfo=timezone.utc)
+        end_ts = start_ts + timedelta(days=1)
+        
+        sql = """
+        SELECT COUNT(DISTINCT HOUR(time)) as hour_count 
+        FROM funding_rates 
+        WHERE market = %s 
+        AND time >= %s 
+        AND time < %s
+        """
+        
+        with conn.cursor(dictionary=True) as cur:
+            cur.execute(sql, (market, start_ts, end_ts))
+            result = cur.fetchone()
+            hour_count = result['hour_count'] if result else 0
+            
+            # Consider day complete if we have data for at least 20 hours
+            # (allows for some missing data due to API issues)
+            return hour_count >= 20
+    except Exception as e:
+        print(f"  -> Error checking day completeness: {e}")
+        return False
+
 def upsert_rows(conn, rows: List[Tuple[datetime, str, float, float, float]]) -> int:
     if not rows:
         return 0
@@ -174,29 +201,90 @@ def run_once(conn, force_start_date: Optional[datetime] = None) -> int:
             continue
 
         days = [d.strftime("%Y-%m-%d") for d in daterange(start_day, today_utc)]
-        print(f"  fetching {len(days)} day(s): {days[0]} -> {days[-1]}")
+        
+        # In backfill mode, filter out days that are already complete
+        if force_start_date:
+            incomplete_days = []
+            for day in days:
+                if is_day_complete(conn, market, day):
+                    print(f"  -> {day} already complete, skipping")
+                else:
+                    incomplete_days.append(day)
+            days = incomplete_days
+            
+        if not days:
+            print("  all days already complete.")
+            continue
+            
+        print(f"  processing {len(days)} day(s): {days[0]} -> {days[-1]}")
 
-        batch = []
-        for day in days:
+        # Process each day individually for immediate DB writes
+        market_total = 0
+        for i, day in enumerate(days, 1):
+            progress = f"({i}/{len(days)})"
+            print(f"  {progress} fetching {day}...")
             recs = fetch_funding_rates(market, day)
+            
+            if not recs:
+                print(f"    -> no data returned for {day}")
+                time.sleep(REQUEST_DELAY_SECONDS + random.random() * 0.1)
+                continue
+                
+            batch = []
             for r in recs:
                 try:
                     batch.append(parse_row(r))
                 except (KeyError, ValueError, ZeroDivisionError) as e:
-                    print(f"  -> skipping bad record: {e}")
+                    print(f"    -> skipping bad record: {e}")
+            
+            if batch:
+                n = upsert_rows(conn, batch)
+                total += n
+                market_total += n
+                print(f"    -> upserted {n} rows for {day}")
+            else:
+                print(f"    -> no valid rows for {day}")
+                
             time.sleep(REQUEST_DELAY_SECONDS + random.random() * 0.1)
 
-        if batch:
-            n = upsert_rows(conn, batch)
-            total += n
-            print(f"  upserted {n} rows for {market}")
-        else:
-            print("  no new rows")
+        print(f"  completed {market}: {len(days)} days processed, {market_total} total rows")
 
     print("=" * 80)
     print(f"PASS COMPLETE: {total} rows inserted/updated")
     print("=" * 80)
     return total
+
+def show_data_summary(conn):
+    """Show summary of existing data in the database"""
+    print("=" * 80)
+    print("DATABASE SUMMARY")
+    print("=" * 80)
+    
+    sql = """
+    SELECT 
+        market,
+        DATE(MIN(time)) as earliest_date,
+        DATE(MAX(time)) as latest_date,
+        COUNT(*) as total_records,
+        COUNT(DISTINCT DATE(time)) as days_with_data
+    FROM funding_rates 
+    GROUP BY market
+    ORDER BY market
+    """
+    
+    with conn.cursor(dictionary=True) as cur:
+        cur.execute(sql)
+        results = cur.fetchall()
+        
+        if not results:
+            print("No data found in database.")
+            return
+            
+        for row in results:
+            print(f"{row['market']:10} | {row['earliest_date']} to {row['latest_date']} | "
+                  f"{row['days_with_data']:3} days | {row['total_records']:6} records")
+    
+    print("=" * 80)
 
 def main():
     parser = argparse.ArgumentParser(description='Drift funding rate ingestor')
@@ -205,24 +293,35 @@ def main():
                              'If specified, runs once and exits instead of continuous mode.')
     parser.add_argument('--run-once', action='store_true', 
                         help='Run once and exit instead of continuous mode')
+    parser.add_argument('--summary', action='store_true',
+                        help='Show summary of existing data and exit')
     
     args = parser.parse_args()
     
-    force_start_date = None
-    if args.backfill_from:
-        try:
-            force_start_date = datetime.strptime(args.backfill_from, '%Y-%m-%d').replace(tzinfo=timezone.utc)
-            print(f"Backfill mode: starting from {force_start_date.strftime('%Y-%m-%d')}")
-        except ValueError:
-            print("Error: Invalid date format. Use YYYY-MM-DD format.")
-            return 1
-    
     conn = db_connect()
     try:
+        if args.summary:
+            show_data_summary(conn)
+            return 0
+            
+        force_start_date = None
+        if args.backfill_from:
+            try:
+                force_start_date = datetime.strptime(args.backfill_from, '%Y-%m-%d').replace(tzinfo=timezone.utc)
+                print(f"Backfill mode: starting from {force_start_date.strftime('%Y-%m-%d')}")
+                # Show current data summary before backfill
+                show_data_summary(conn)
+            except ValueError:
+                print("Error: Invalid date format. Use YYYY-MM-DD format.")
+                return 1
+        
         if args.backfill_from or args.run_once:
             # Single run mode
             changed = run_once(conn, force_start_date)
             print(f"Single run completed: {changed} rows processed")
+            if args.backfill_from:
+                # Show summary after backfill
+                show_data_summary(conn)
         else:
             # Continuous mode (original behavior)
             while True:

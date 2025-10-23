@@ -36,3 +36,6 @@ source venv/bin/activate
 
 # Install dependencies
 pip install -r requirements.txt
+
+python main.py
+python main.py --backfill-from 2025-09-01 --run-once
